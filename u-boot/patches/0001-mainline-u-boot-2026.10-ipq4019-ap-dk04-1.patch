@@ -1,0 +1,226 @@
+diff --git a/arch/arm/mach-ipq40xx/Kconfig b/arch/arm/mach-ipq40xx/Kconfig
+index f9db55c42aa..8a805ecab6c 100644
+--- a/arch/arm/mach-ipq40xx/Kconfig
++++ b/arch/arm/mach-ipq40xx/Kconfig
+@@ -1,15 +1,19 @@
+ if ARCH_IPQ40XX
+ 
+ config SYS_SOC
+-	default "ipq40xx"
++        default "ipq40xx"
+ 
+ config SYS_MALLOC_F_LEN
+-	default 0x2000
++        default 0x2000
+ 
+ config TEXT_BASE
+-	default 0x87300000
++        default 0x87300000
+ 
+ config NR_DRAM_BANKS
+-	default 1
++        default 1
++
++config SYS_CONFIG_NAME
++        string
++        default "ipq40xx_ap_dk04_1"
+ 
+ endif
+diff --git a/arch/arm/mach-ipq40xx/cpu.c b/arch/arm/mach-ipq40xx/cpu.c
+index 92c34d61118..67a66e0496b 100644
+--- a/arch/arm/mach-ipq40xx/cpu.c
++++ b/arch/arm/mach-ipq40xx/cpu.c
+@@ -9,6 +9,7 @@
+ 
+ #include <cpu_func.h>
+ #include <init.h>
++#include <asm/io.h>
+ 
+ int dram_init(void)
+ {
+@@ -41,3 +42,31 @@ int __weak board_init(void)
+ {
+ 	return 0;
+ }
++
++/* Minimal architected timer / reset stubs for IPQ40xx */
++unsigned long get_tbclk(void)
++{
++	return 48000000UL; /* arch_sys_counter freq from Linux log */
++}
++
++unsigned long long timer_read_counter(void)
++{
++	unsigned long lo, hi;
++
++	asm volatile("mrrc p15, 0, %0, %1, c14" : "=r"(lo), "=r"(hi));
++	return ((unsigned long long)hi << 32) | lo;
++}
++
++int print_cpuinfo(void)
++{
++	printf("CPU:   IPQ4019 (Cortex-A7)\n");
++	return 0;
++}
++
++void reset_cpu(void)
++{
++	/* IPQ4019 pshold: write 0 to trigger cold reset (Linux msm-poweroff) */
++	writel(0, (void __iomem *)0x4ab000);
++	while (1)
++		;
++}
+diff --git a/arch/arm/mach-ipq40xx/include/mach/gpio.h b/arch/arm/mach-ipq40xx/include/mach/gpio.h
+index 53c6ae06490..11e8104baf2 100644
+--- a/arch/arm/mach-ipq40xx/include/mach/gpio.h
++++ b/arch/arm/mach-ipq40xx/include/mach/gpio.h
+@@ -10,11 +10,25 @@
+ #include <asm/types.h>
+ #include <stdbool.h>
+ 
++struct msm_special_pin_data {
++	char *name;
++
++	u32 ctl_reg;
++	u32 io_reg;
++
++	unsigned pull_bit:5;
++	unsigned drv_bit:5;
++
++	unsigned oe_bit:5;
++	unsigned in_bit:5;
++	unsigned out_bit:5;
++};
++
+ struct msm_pin_data {
+ 	int pin_count;
+ 	const unsigned int *pin_offsets;
+-	/* Index of first special pin, these are ignored for now */
+ 	unsigned int special_pins_start;
++	const struct msm_special_pin_data *special_pins_data;
+ };
+ 
+ static inline u32 qcom_pin_offset(const unsigned int *offs, unsigned int selector)
+@@ -32,4 +46,19 @@ static inline bool qcom_is_special_pin(const struct msm_pin_data *pindata, unsig
+ 	return pindata->special_pins_start && pin >= pindata->special_pins_start;
+ }
+ 
++struct udevice;
++
++/**
++ * msm_pinctrl_is_reserved() - Check if a pin lies in a reserved range
++ *
++ * @dev: pinctrl device
++ * @pin: Pin number
++ *
++ * Returns: true if pin is reserved, otherwise false
++ *
++ * Call using dev_get_parent() from the GPIO device, it is a child of
++ * the pinctrl device.
++ */
++bool msm_pinctrl_is_reserved(struct udevice *dev, unsigned int pin);
++
+ #endif /* _QCOM_GPIO_H_ */
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+index a11f3043670..97369333074 100644
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -333,7 +333,7 @@ config MSCC_SGPIO
+ 
+ config MSM_GPIO
+ 	bool "Qualcomm GPIO driver"
+-	depends on DM_GPIO && ARCH_SNAPDRAGON
++	depends on DM_GPIO && (ARCH_SNAPDRAGON || ARCH_IPQ40XX)
+ 	help
+ 	  Support GPIO controllers on Qualcomm Snapdragon family of SoCs.
+ 	  This controller have single bank (default name "soc"), every
+diff --git a/drivers/net/essedma.c b/drivers/net/essedma.c
+index fccc5f5a440..43a1e400f5f 100644
+--- a/drivers/net/essedma.c
++++ b/drivers/net/essedma.c
+@@ -614,6 +614,7 @@ static int essedma_of_phy(struct udevice *dev)
+ 			}
+ 
+ 			phydev->node = phandle_args.node;
++			phydev->autoneg = AUTONEG_ENABLE;
+ 			ret = phy_config(phydev);
+ 
+ 			esw->phydev[num_phy] = phydev;
+@@ -1136,8 +1137,13 @@ static int essedma_probe(struct udevice *dev)
+ 		printf("Unknown MII interface\n");
+ 	}
+ 
++	/* IPQ40xx: skip PSGMII self-test. It calls qca8075_ess_reset() which
++	 * uses phydev[num_phy - 1] and, with a single enabled port, corrupts
++	 * the WAN PHY's BMCR (kills autoneg). Link works without it. */
++#if 0
+ 	if (priv->esw.port_wrapper_mode == PHY_INTERFACE_MODE_PSGMII)
+ 		psgmii_self_test(dev);
++#endif
+ 
+ 	ess_switch_init(&priv->esw);
+ 
+diff --git a/drivers/spi/spi-qup.c b/drivers/spi/spi-qup.c
+index dc001e6e4cc..a0caf9c70d9 100644
+--- a/drivers/spi/spi-qup.c
++++ b/drivers/spi/spi-qup.c
+@@ -175,6 +175,7 @@
+ struct qup_spi_priv {
+ 	phys_addr_t base;
+ 	struct clk clk;
++	struct clk clk_iface;
+ 	u32 num_cs;
+ 	struct gpio_desc cs_gpios[SPI_NUM_CHIPSELECTS];
+ 	bool cs_high;
+@@ -615,6 +616,7 @@ static int qup_spi_hw_init(struct udevice *dev)
+ {
+ 	struct udevice *bus = dev_get_parent(dev);
+ 	struct qup_spi_priv *priv = dev_get_priv(bus);
++	u32 val;
+ 	int ret;
+ 
+ 	/* QUPn module configuration */
+@@ -647,6 +649,11 @@ static int qup_spi_hw_init(struct udevice *dev)
+ 						(NO_LOOP_BACK |
+ 						SLAVE_OPERATION));
+ 
++	/* IPQ40xx: ensure input-first sampling (mode 0) */
++	val = readl(priv->base + SPI_CONFIG);
++	val |= SPI_CONFIG_INPUT_FIRST;
++	writel(val, priv->base + SPI_CONFIG);
++
+ 	/*
+ 	 * Configure SPI IO Control Register
+ 	 * CLK_ALWAYS_ON = 0
+@@ -761,6 +768,11 @@ static int qup_spi_probe(struct udevice *dev)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* IPQ40xx QUP SPI also needs the AHB/iface clock */
++	ret = clk_get_by_index(dev, 1, &priv->clk_iface);
++	if (!ret)
++		clk_enable(&priv->clk_iface);
++
+ 	priv->num_cs = dev_read_u32_default(dev, "num-cs", 1);
+ 
+ 	ret = gpio_request_list_by_name(dev, "cs-gpios", priv->cs_gpios,
+diff --git a/include/phy_interface.h b/include/phy_interface.h
+index b74f4ccd84a..82e9fefe906 100644
+--- a/include/phy_interface.h
++++ b/include/phy_interface.h
+@@ -47,6 +47,7 @@ typedef enum {
+ 	/* 10GBASE-KR - with Clause 73 AN */
+ 	PHY_INTERFACE_MODE_10GKR,
+ 	PHY_INTERFACE_MODE_QUSGMII,
++	PHY_INTERFACE_MODE_PSGMII,
+ 	PHY_INTERFACE_MODE_1000BASEKX,
+ #if defined(CONFIG_ARCH_LX2160A) || defined(CONFIG_ARCH_LX2162A)
+ 	/* LX2160A SERDES modes */
+@@ -94,6 +95,7 @@ static const char * const phy_interface_strings[] = {
+ 	[PHY_INTERFACE_MODE_10GKR]		= "10gbase-kr",
+ 	[PHY_INTERFACE_MODE_100BASEX]		= "100base-x",
+ 	[PHY_INTERFACE_MODE_QUSGMII]		= "qusgmii",
++	[PHY_INTERFACE_MODE_PSGMII]        = "psgmii",
+ #if defined(CONFIG_ARCH_LX2160A) || defined(CONFIG_ARCH_LX2162A)
+ 	/* LX2160A SERDES modes */
+ 	[PHY_INTERFACE_MODE_25G_AUI]		= "25g-aui",

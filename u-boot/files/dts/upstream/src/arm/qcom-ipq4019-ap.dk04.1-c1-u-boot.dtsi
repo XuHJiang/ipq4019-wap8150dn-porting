@@ -1,0 +1,57 @@
+#include "qcom-ipq4019-u-boot.dtsi"
+
+/ {
+        aliases {
+                serial0 = &blsp1_uart1;
+        };
+
+        chosen {
+                stdout-path = "serial0:115200n8";
+        };
+};
+
+&blsp1_uart1 {
+        u-boot,dm-pre-reloc;
+        status = "okay";
+};
+
+&blsp1_spi1 {
+        u-boot,dm-pre-reloc;
+        status = "okay";
+};
+
+&nand {
+        status = "disabled";
+};
+
+&tlmm {
+        u-boot,dm-pre-reloc;
+};
+
+&gcc {
+        u-boot,dm-pre-reloc;
+};
+
+&spi_0_pins {
+        u-boot,dm-pre-reloc;
+};
+
+&mdio {
+        status = "okay";
+        u-boot,dm-pre-reloc;
+};
+
+&switch {
+        status = "okay";
+};
+
+&switch {
+        mac-address = [00 11 22 33 44 55];
+        ports {
+                phy-mode = "psgmii";
+        };
+};
+
+&swport5 {
+        status = "okay";
+};
