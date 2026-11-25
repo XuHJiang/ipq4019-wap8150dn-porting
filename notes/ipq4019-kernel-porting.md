@@ -577,7 +577,84 @@ $env:SSH_PASS='<密码>'
 
 ---
 
-## 10. 咨询记录
+## 10. 移植方法论与排障流程（怎么做的）
+
+这一节记录「如何得出上面的结论」，而不只是结论本身。核心原则是：**不改 flash、每次只改一处、用证据定位、失败可回滚**。
+
+### 10.1 总体循环
+
+```
+静态分析源码/配置
+  → 改一处代码或 defconfig
+  → 编译
+  → 厂商 U-Boot 里 TFTP 下载 + go 链加载（RAM，不写 flash）
+  → 看串口日志/命令输出
+  → 用 addr2line / dm tree / 寄存器打印定位
+  → 回到第一步
+```
+
+失败时**断电重启即恢复原 U-Boot**，所以可以无限试错。
+
+### 10.2 每一步用的工具和判据
+
+| 阶段 | 手段 | 关键判据 |
+|---|---|---|
+| 确认主线支持什么 | `ls configs/`、`grep -R ARCH_IPQ40XX arch/arm`、`find arch/arm/dts -name '*ipq4019*'`、`git status --short` | 有 SoC 层但无 defconfig / board DTS |
+| 编译报错 | 直接读编译器输出；`grep -R` 找符号定义 | `PHY_INTERFACE_MODE_PSGMII undeclared` → 补枚举；`pinctrl` 结构体缺成员 → 同步 gpio.h |
+| 链加载 data abort | 看 `pc/lr`，用 `arm-none-linux-gnueabihf-addr2line -e u-boot -f -C <reloc_pc>` | 定位到 `phy_write`/`qca8075_ess_reset` 等具体函数 |
+| 设备是否绑定 | `dm tree` | `[+]`=probed，`[ ]`=未 probe；`spi_qup [+]` 但 `flash@0 [ ]` 说明探针还没跑 |
+| DTS 是否生效 | `scripts/dtc/dtc -I dtb -O dts u-boot.dtb` 反编译；`dbg PINMUX` 打印 | 确认 `cs-gpios`、pre-reloc、pin mux 真进了镜像 |
+| SPI 读不到 ID | 加 `DBG QUP:` 打印 CS 值 / tx / rx；读 QUP 寄存器 | CS/命令正常但 rx 全 ff → 看 `SPI_CONFIG` 是否置 INPUT_FIRST |
+| 网卡不通 | `mii info`、`mii read/write`、`mdio list`、`ethsw`、`ping` | BMCR/BMSR 判断 link 与 autoneg 状态 |
+| 复位卡死 | 查 Linux `msm-poweroff.c` 找到 pshold 寄存器 | 写 0 触发冷复位 |
+
+### 10.3 关键排障实例（从现象到根因）
+
+1. **`go 0x84000000` 立刻 data abort**
+   - 现象：`pc=84024d30`，`r3=87358fa4`（0x873xxxxx）。
+   - 推理：全局数据指针按链接基址 `0x87300000` 算，但镜像跑在 `0x84000000`。
+   - 处理：链加载版 `CONFIG_TEXT_BASE=0x84000000`（链接基址=加载地址）。
+
+2. **`tftpboot 0x87300000` 报 load address not allowed**
+   - 推理：`0x87300000` 是厂商 U-Boot 自身运行区，不能覆盖自身。
+   - 结论：链加载只能用空闲 RAM，且必须等于新 U-Boot 链接基址。
+
+3. **`sf probe` 返回 `ff ff ff`**
+   - 先排除：ID 表、设备绑定（`dm tree`）、pinctrl/pre-reloc（反编译 DTB）、CS 极性（打印 BEGIN/END 写值）、iface 时钟（补开）、引脚复用（`DBG PINMUX` 确认 gpio13/14/15 mux=blsp_spi0）。
+   - 最后读 QUP 寄存器：`QUP_CONFIG=0x107` 正常，`SPI_CONFIG=0` —— `INPUT_FIRST` 没置位。
+   - 修复：`qup_spi_hw_init()` 强制 `val |= SPI_CONFIG_INPUT_FIRST` → rx 变成 `c2 20 1a c2`，识别成功。
+
+4. **`Net: No ethernet found`**
+   - `dm tree` 里 `ethernet 0 [ ] essedma` → probe 失败。
+   - 逐项补：`&switch status="okay"`、`phy-mode="psgmii"`、`mac-address`、启用 `&swport5`。
+   - 漏掉 `&swport5` 时 `num_phy=0`，`qca8075_ess_reset()` 取 `phydev[-1]` → data abort（用 addr2line 定位）。
+
+5. **ARP Retry count exceeded**
+   - `mii info` 显示 PHY4 停在 10HDX；`BMCR=0x0040`（未开 AN），`BMSR=0x7949`（link down）。
+   - 手动 `mii write 4 0 0x1200` 后 link up、TFTP 通 → 证明是 autoneg 没启动。
+   - 加 `phydev->autoneg = AUTONEG_ENABLE` 后仍不行 → 继续查发现 `psgmii_self_test()` 里的 `qca8075_ess_reset()` 又把 BMCR 写坏。
+   - 最终修复：`#if 0` 跳过自测。
+
+### 10.4 重要经验
+
+- **不要同时改多处**：每次只动一个变量，否则无法判断哪个修复生效。
+- **优先用现成证据**：Linux 6.12 的 DTS、Linux `msm-poweroff.c`、U-Boot 驱动源码里都有答案，比猜快得多。
+- **打印比推理可靠**：加临时 `DBG` 打印确认 CS/命令/寄存器，定位后删除（干净版已从 git 还原/删除调试代码）。
+- **地址类问题先怀疑链接基址**：`go` 卡死或 data abort，先看 `CONFIG_TEXT_BASE` 与加载地址是否一致。
+- **网口问题先问“link up 了吗”**：`mii info` / BMCR / BMSR 比看 `Net:` 输出有效。
+- **备份与回滚**：实验全程 RAM 链加载，断电即恢复；刷 mtd6 前必须有 EDL/编程器 + 备份。
+
+### 10.5 如果你想自己重做
+
+1. 拉主线 U-Boot 2026.10，应用仓库里的 patch，拷入 `u-boot/files/`；
+2. 编译，拿 `u-boot.bin` 放到 TFTP 根目录；
+3. 在厂商 U-Boot 里 `tftpboot 0x84000000 u-boot.bin; go 0x84000000`；
+4. 按上面 10.2 的判据逐项验证：`dm tree` → `sf probe` → `mii info` → `sf read` + `bootm`；
+5. 出错时先对照 10.3 的“现象→根因”表，再决定改哪一处。
+
+---
+
+## 11. 咨询记录
 
 ### 2026-11-23
 
