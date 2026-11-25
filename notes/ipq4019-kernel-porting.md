@@ -605,6 +605,18 @@ $env:SSH_PASS='<密码>'
   - 没有 → 自己 `make defconfig` 起步，用 `menuconfig` 勾选必要项，最后 `make savedefconfig` 生成自己的 defconfig（我们的 `ipq40xx_ap_dk04_1_defconfig` 就是这么来的）。
 - 没有正确 defconfig 的后果：编译可能过，但串口没输出、SPI 不 probe、FIT 起不来，或 `TEXT_BASE` 不对导致链加载 data abort——这正是我们后面逐项补齐的内容。
 
+#### “主线有 SoC 层支持”是什么意思
+
+主线代码是分层的：
+
+| 层次 | 内容 | 主线是否具备 |
+|---|---|---|
+| SoC / arch 层 | `CONFIG_ARCH_IPQ40XX`、`arch/arm/mach-ipq40xx/cpu.c`、clock (`CLK_QCOM_IPQ4019`)、pinctrl (`PINCTRL_QCOM_IPQ4019`)、串口 `serial_msm`、SPI `spi-qup`、SMEM、`essedma` 等 SoC 内部 IP 的驱动 | ✅ 有 |
+| 板级层 | defconfig、完整板级 DTS（串口接哪路、Flash 型号/大小、env 偏移、`TEXT_BASE`、MAC/PHY/交换端口） | ❌ 没有本板的 |
+| 外设/板载设备层 | 具体 SPI NOR 芯片、具体 PHY、具体 switch 配置 | 部分有，需板级 DTS 绑定 |
+
+“有 SoC 层”只表示：**芯片内部的 IP 块怎么驱动，主线已经写好了**，我们不用从零写 clock/pinctrl/串口驱动；但这些驱动默认是 `n`，需要在 defconfig 里打开，并通过 DTS 把本板的硬件接法告诉它们。所以 Phase 1 的结论是“有引擎，但没车壳/线束”，后面工作是建板级配置，而不是从零造引擎。
+
 ### 10.2 每一步用的工具和判据
 
 | 阶段 | 手段 | 关键判据 |
