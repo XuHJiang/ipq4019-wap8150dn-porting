@@ -595,6 +595,16 @@ $env:SSH_PASS='<密码>'
 
 失败时**断电重启即恢复原 U-Boot**，所以可以无限试错。
 
+#### defconfig 的作用，以及为什么先找它
+
+- `defconfig` 是 **Kconfig 选项的最小种子文件**：`make <board>_defconfig` 会读入它，展开生成完整的 `.config`；后续 `make` 只看 `.config`。
+- U-Boot/Linux 有成千上万个 Kconfig 选项，绝大多数默认都是 n。defconfig 记录了某一块板“已知能工作”的基线：ARCH/CPU、串口地址与时钟、SPI/MTD、FIT/bootm、env 位置、`CONFIG_TEXT_BASE`、默认设备树等。
+- **同 SoC 不同板子的 defconfig 仍不同**：串口接哪个 UART、Flash 型号/大小、env 在哪个分区、启动介质、MAC/PHY 等都因板而异。所以不能只按 SoC 随便找一个 defconfig 用，要找**本板**的。
+- 在 `configs/` 里 `grep -iE 'ipq|qcom|dk|ap'` 就是在问：“上游是否已经有人为这块板做过基线配置？”：
+  - 有 → 从它起步，按需微调，工作量小；
+  - 没有 → 自己 `make defconfig` 起步，用 `menuconfig` 勾选必要项，最后 `make savedefconfig` 生成自己的 defconfig（我们的 `ipq40xx_ap_dk04_1_defconfig` 就是这么来的）。
+- 没有正确 defconfig 的后果：编译可能过，但串口没输出、SPI 不 probe、FIT 起不来，或 `TEXT_BASE` 不对导致链加载 data abort——这正是我们后面逐项补齐的内容。
+
 ### 10.2 每一步用的工具和判据
 
 | 阶段 | 手段 | 关键判据 |
