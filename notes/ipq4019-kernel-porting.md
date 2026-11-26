@@ -2,6 +2,8 @@
 
 > 维护规则：每次咨询后把新增知识点补进对应章节，并在文末「咨询记录」追加一条。
 > 不在笔记中保存明文密码/密钥；调试脚本统一放 `D:\TMP\opencode`。
+> **推送策略（2026-11-25 用户要求）：后续咨询只更新本地笔记，暂不推送 GitHub；等用户明确通知后一次性推送。**
+> **执行策略（2026-11-25 用户要求）：后续移植操作全部由用户自己执行，我只负责讲解思路、给出命令、判读用户贴回的输出，不再代为在编译机/设备上执行。**
 > 本文已把早期被实测推翻的推断更正并合并（保留必要的历史说明），以「最终结论」为准。
 
 ---
@@ -365,8 +367,12 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -j$(nproc) zImage dtbs
   qcom-ipq4019-ap.dk04.1.dtsi
   qcom-ipq4019-ap.dk04.1-c1.dts
   ```
+  **若内核/U-Boot 都没有 IPQ4019 DTS**，获取顺序：① 找其它 Linux 版本 / OpenWrt `target/linux/ipq40xx` / QSDK 的 DTS；② 找同 SoC 近似板 DTS 改写（model/compatible、memory、chosen、pinctrl、fixed-partitions、SPI/UART/MDIO）；③ 从设备现有 FIT 里直接抽 DTB 反编译：`dd if=/dev/mtd8 of=/tmp/fit.itb` → `dumpimage -l` 找 `fdt@ap.dk04.1-c1` 的 position → `dumpimage -i /tmp/fit.itb -o /tmp/board.dtb -T flat_dt -p <pos> fdt@ap.dk04.1-c1` → `dtc -I dtb -O dts -o board.dts /tmp/board.dtb`，得到厂商原始 DTS 再按 U-Boot 需要补 `u-boot,dm-pre-reloc`/`chosen/stdout-path`。DTS 是数据，没有它内核就不知道硬件；有现成 DTB 也能直接给内核用。
 - 把它们拷到 U-Boot 的 `arch/arm/dts/` 和 `dts/upstream/src/arm/`（因 `CONFIG_OF_UPSTREAM=y`，实际从后者找）。
+- `CONFIG_OF_UPSTREAM` 的作用：让 U-Boot 从 `dts/upstream/src/<arch>/`（上游 Linux DTS 副本）取**基础 DTS**，而不是从传统 `arch/arm/dts/`；板级 `-u-boot.dtsi` 片段仍由 U-Boot 自己维护。`ARCH_IPQ40XX` 对它只是 `imply`（默认开），可以在 defconfig 里写 `# CONFIG_OF_UPSTREAM is not set` 关掉，此时只需把 DTS 放在 `arch/arm/dts/`。它与 `CONFIG_OF_CONTROL` 不同：后者必须保持 y，因为要把 DTB 编进 u-boot.bin。我们为了避免路径问题两个目录都拷了，所以关掉也能编。
+- 实测若 defconfig 没设 `CONFIG_DEFAULT_DEVICE_TREE`、且没拷 DTS，链接完 `u-boot` 后报错 `Device Tree Source (dts/upstream/src/arm/unset.dtb) is not correctly specified. Please define 'CONFIG_DEFAULT_DEVICE_TREE'`，`dts/Makefile:54` 失败。修复：defconfig 加 `CONFIG_DEFAULT_DEVICE_TREE="qcom-ipq4019-ap.dk04.1-c1"`，拷入上述 DTS + dt-bindings + 板级 u-boot.dtsi，重新 defconfig 后再 make。也可临时用 `make DEVICE_TREE=<name>`，但 defconfig 更持久。
 - 从 Linux `include/dt-bindings/` 补拷头文件：`clock/qcom,gcc-ipq4019.h`、`interrupt-controller/arm-gic.h`、`irq.h`、`gpio/gpio.h`、`input/input.h`、`input/linux-event-codes.h`。
+- 为什么叫这个名字、为什么必须存在：U-Boot 规定“板级 `-u-boot.dtsi` overlay”的文件名 = `CONFIG_DEFAULT_DEVICE_TREE` 的值 + `-u-boot.dtsi`。构建时若找到该文件，会在用 `dtc` 编译基础 `.dts` 时自动把它 include 进去。目的：**不修改上游 Linux 的 DTS**，把只跟 U-Boot 有关的改动（重定位前就要用的 `u-boot,dm-pre-reloc`、U-Boot 的 `chosen/stdout-path`、U-Boot 才需要的 mdio/switch/MAC/端口使能、本机无 NAND 要关掉等）单独放在 overlay。没有它，基础 DTS 在 Linux 里是对的，但在 U-Boot 阶段串口/SPI/网卡可能未就绪，就会出现 `sf probe` 读不到 ID、`Net: No ethernet found` 等。我们两个目录都放了，所以无论 OF_UPSTREAM 开关都能命中。
 - 新建 `qcom-ipq4019-ap.dk04.1-c1-u-boot.dtsi`，包含：
   - `#include "qcom-ipq4019-u-boot.dtsi"`
   - `chosen { stdout-path = "serial0:115200n8"; }`，alias `serial0 = &blsp1_uart1`
@@ -376,21 +382,31 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -j$(nproc) zImage dtbs
   - `&mdio { status = "okay"; u-boot,dm-pre-reloc; }`
   - `&switch { status = "okay"; mac-address = [00 11 22 33 44 55]; ports { phy-mode = "psgmii"; }; }`
   - `&swport5 { status = "okay"; }`（WAN 口，PHY4，厂商日志中唯一 link up 的口）
-- `CONFIG_DEFAULT_DEVICE_TREE="qcom-ipq4019-ap.dk04.1-c1"`。
+- `CONFIG_DEFAULT_DEVICE_TREE="qcom-ipq4019-ap.dk04.1-c1"` **只是设备树的名字，不含路径也不含 `.dts`**。`dts/Makefile` 的做法：
+  - `DEVICE_TREE := $(CONFIG_DEFAULT_DEVICE_TREE:"%"=%)`；
+  - 若 `CONFIG_OF_UPSTREAM=y`（本板由 `ARCH_IPQ40XX` imply 默认开）→ `dt_dir := dts/upstream/src/$(ARCH)`，即权威文件是 **`dts/upstream/src/arm/qcom-ipq4019-ap.dk04.1-c1.dts`**；
+  - 若关掉 OF_UPSTREAM → `dt_dir := arch/$(ARCH)/dts`，即 **`arch/arm/dts/qcom-ipq4019-ap.dk04.1-c1.dts`**。
+  - 该 `.dts` 通过相对 include 引用同目录的 `qcom-ipq4019-ap.dk04.1.dtsi` → `qcom-ipq4019.dtsi`；`dt-bindings` 头文件来自 `include/dt-bindings/`。
+  - 编译生成 `dts/upstream/src/arm/qcom-ipq4019-ap.dk04.1-c1.dtb`（或 arch/arm/dts/ 下），再拷成 `dts/dt.dtb`、`u-boot.dtb`，最后 CAT 进 `u-boot.bin`。
+  - U-Boot 还会自动找同名加 `-u-boot.dtsi` 的片段：`qcom-ipq4019-ap.dk04.1-c1-u-boot.dtsi`（我们两个目录都放了，所以无论从哪找都能命中）。
 
 ### 6.4 必要源码补丁（共 6 个既有文件）
 
 | 文件 | 改动 |
 |---|---|
 | `arch/arm/mach-ipq40xx/Kconfig` | 增加 `config SYS_CONFIG_NAME` 默认 `ipq40xx_ap_dk04_1` |
-| `arch/arm/mach-ipq40xx/cpu.c` | 补 `get_tbclk()`(48 MHz)、`timer_read_counter()`(CP15 CNTVCT)、`print_cpuinfo()`、`reset_cpu()`；reset 写 pshold `0x4ab000`=0 |
-| `arch/arm/mach-ipq40xx/include/mach/gpio.h` | 同步 snapdragon 版本，补 `struct msm_special_pin_data`、`special_pins_data`、`msm_pinctrl_is_reserved` 声明 |
+| `arch/arm/mach-ipq40xx/cpu.c` | 补 `get_tbclk()`(48 MHz)、`timer_read_counter()`(CP15 CNTVCT)、`print_cpuinfo()`、`reset_cpu()`；reset 写 pshold `0x4ab000`=0。实测若不补会在链接时报 `undefined reference to reset_cpu/get_tbclk/print_cpuinfo/timer_read_counter`（common 代码要这些 SoC 级函数，主线 ipq40xx cpu.c 只实现了 dram_init/caches/board_init）。`print_cpuinfo` 返回 int（写成 void 会 conflicting types）；`reset_cpu` 需 `#include <asm/io.h>` 用 writel。 |
+| `arch/arm/mach-ipq40xx/include/mach/gpio.h` | 同步 snapdragon 版本，补 `struct msm_special_pin_data`、`special_pins_data`、`msm_pinctrl_is_reserved` 声明；实测若不改会在 `pinctrl-qcom.c` 报 `implicit declaration of msm_pinctrl_is_reserved`、`struct msm_pin_data has no member special_pins_data`、`conflicting types for msm_pinctrl_is_reserved`（GCC 把 implicit declaration 当 error）。原因：通用 `drivers/pinctrl/qcom/pinctrl-qcom.c` 由 Snapdragon 和 IPQ40xx 共用，但 ipq40xx 的 mach/gpio.h 版本过旧缺这些定义。修复：`cp arch/arm/mach-snapdragon/include/mach/gpio.h arch/arm/mach-ipq40xx/include/mach/gpio.h` 后重编。clock-qcom.c 的 `%llx` 格式警告非致命，可忽略。 |
 | `drivers/gpio/Kconfig` | `MSM_GPIO` 依赖从 `ARCH_SNAPDRAGON` 扩为 `ARCH_SNAPDRAGON || ARCH_IPQ40XX` |
 | `drivers/spi/spi-qup.c` | 补开 iface(AHB) 时钟；`qup_spi_hw_init()` 强制 `SPI_CONFIG_INPUT_FIRST`（BIT9） |
 | `include/phy_interface.h` | 增加 `PHY_INTERFACE_MODE_PSGMII` 与 `"psgmii"` 字符串 |
 | `drivers/net/essedma.c` | `essedma_of_phy()` 中 `phy_config()` 前设 `phydev->autoneg = AUTONEG_ENABLE`；`#if 0` 跳过 `psgmii_self_test()`（其 `qca8075_ess_reset()` 用 `phydev[num_phy-1]`，单端口时是 WAN PHY4，会写 BMCR 冲掉 autoneg） |
 
 新增文件：板级 defconfig、板级 config header（`CFG_SYS_INIT_RAM_ADDR 0x87000000` / `SIZE 0x10000`）、3 个 DTS + 板级 u-boot.dtsi、dt-bindings 头文件。
+
+> 实测：若没加 `SYS_CONFIG_NAME` 和板级 config header，编译会在汇编阶段报 `arch/arm/cpu/armv7/start.S:287: Error: syntax error -- 'ldr r0,=((CFG_SYS_INIT_RAM_ADDR+CFG_SYS_INIT_RAM_SIZE-240))'`（crt0.S:106 同样）。原因：`CFG_SYS_INIT_RAM_ADDR/SIZE` 是板级头文件里的宏，不是 Kconfig 选项；未定义时宏展开为空，汇编器看到 `((+ -240))` 就报语法错。修复就是在 mach Kconfig 里加 `config SYS_CONFIG_NAME` 默认 `ipq40xx_ap_dk04_1`，并创建 `include/configs/ipq40xx_ap_dk04_1.h` 定义这两个宏，然后重新 `make <defconfig>`。
+>
+> `include/configs/` 里大多是板级头文件，但也有 SoC/通用头文件（如 `qcom.h`、`am33xx.h`、`ti.h`），不是每个文件都对应一块具体板；真正被本次编译选中的那个由 `CONFIG_SYS_CONFIG_NAME` 决定。机制：`scripts/Makefile.autoconf` 会生成 `include/config.h`，其中有一行 `#include <configs/$(CONFIG_SYS_CONFIG_NAME).h>`；所以 `CONFIG_SYS_CONFIG_NAME="ipq40xx_ap_dk04_1"` 就会包含 `include/configs/ipq40xx_ap_dk04_1.h`（值不含 `.h`）。该头文件提供少数还没迁到 Kconfig 的低级 `CFG_*` 宏；绝大多数选项来自 Kconfig（`include/generated/autoconf.h`）。也可直接在 defconfig 写 `CONFIG_SYS_CONFIG_NAME="ipq40xx_ap_dk04_1"` 覆盖默认值。验证：`grep -n 'SYS_CONFIG_NAME' .config include/config/auto.conf; grep -n 'configs/' include/config.h`。
 
 ### 6.5 defconfig 关键项（`configs/ipq40xx_ap_dk04_1_defconfig`）
 
@@ -420,6 +436,20 @@ CONFIG_IPADDR="172.18.0.136" / CONFIG_SERVERIP="172.18.0.134" / CONFIG_NETMASK="
 ```
 
 > 关掉 TOOLS_* 是为了绕过编译机缺失的 OpenSSL/GnuTLS 头文件。`CONFIG_TOOLS_KWBIMAGE` 会 select LIBCRYPTO，必须一起关。字符串配置必须带引号，否则被解析为空。
+> 实测若最小 defconfig 不含这三行，编译会在 host tools 阶段报 `include/image.h:1606: fatal error: openssl/evp.h: No such file or directory`（`tools/aisimage.o`/`amlimage.o`/`fit_common.o`）。这是**主机工具**编译问题，不是 ARM 目标代码；修复就是在 defconfig 加 `# CONFIG_TOOLS_LIBCRYPTO is not set`、`# CONFIG_TOOLS_KWBIMAGE is not set`、`# CONFIG_TOOLS_MKEFICAPSULE is not set`，然后重新 `make <defconfig>`。
+> 实测坑：`CONFIG_SYS_LOAD_ADDR` 是 string 类型，写成 `=0x84000000`（无引号）会在 `syncconfig` 时报 `.config:194:warning: symbol value '' invalid for SYS_LOAD_ADDR`，并触发 `Restart config...` 交互式询问同一项多次而卡住。必须写成 `CONFIG_SYS_LOAD_ADDR="0x84000000"`；改完重新 `make <defconfig>` 生成干净 `.config` 再编译。
+
+**真正编译镜像的命令**（必须用 Arm GNU 13.2，系统 `arm-linux-gnueabi-` 是 GCC 7.3，会在 `checkgcc10` 处失败）：
+
+```sh
+cd ~/u-boot-clean
+TC=$HOME/arm-gnu-toolchain-13.2.Rel1-x86_64-arm-none-linux-gnueabihf/bin/arm-none-linux-gnueabihf-
+make ARCH=arm CROSS_COMPILE=$TC ipq4019_defconfig    # 或自己的 defconfig 名
+make ARCH=arm CROSS_COMPILE=$TC -j$(nproc)
+ls -lh u-boot.bin u-boot.dtb
+```
+
+产物在源码树根目录：`u-boot.bin`（含 DTB）、`u-boot.dtb`。建议用 `timeout 600 make ...` 或别把输出无限重定向到日志（曾出现过 17GB 失控日志占满磁盘）。
 
 ### 6.6 链加载与 TEXT_BASE 坑
 
@@ -434,6 +464,20 @@ CONFIG_IPADDR="172.18.0.136" / CONFIG_SERVERIP="172.18.0.134" / CONFIG_NETMASK="
   - 解决：链加载版 `CONFIG_TEXT_BASE=0x84000000`（链接基址 = 加载地址）。
   - 后来 `tftpboot 0x85000000 ... go 0x85000000` 卡死同理：必须在其链接基址运行。
 - 若将来做永久 flash 版，必须另编 `CONFIG_TEXT_BASE=0x87300000` 的镜像，写到 mtd6 后由 SBL1 原生加载；之后运行时在 0x87300000，0x85000000 空闲，可用作 tftp 数据中转。
+
+**`CONFIG_TEXT_BASE` vs `CONFIG_SYS_LOAD_ADDR`（两者不必相同）**：
+
+| 选项 | 作用 | 何时生效 |
+|---|---|---|
+| `CONFIG_TEXT_BASE` | U-Boot **自身的链接基址**（链接脚本 `u-boot.lds` 用它）。早期代码按它计算全局数据/重定位偏移，所以镜像首次执行的地址必须等于它，否则 data abort | 链接阶段 + 上电/链加载瞬间 |
+| `CONFIG_SYS_LOAD_ADDR` | `tftpboot`/`load` 等**不指定地址时的默认下载目的地**，也是 `bootm` 不带地址时的默认镜像地址 | 运行时命令默认参数 |
+
+- 两者**没有必须相等的要求**。我们的链加载版把它们都设成 `0x84000000` 只是为了省事：`tftpboot u-boot.bin` 不写地址时正好落到链接基址。
+- 如果每次都显式写 `tftpboot 0x84000000 ...`，`SYS_LOAD_ADDR` 写成别的值也不影响链加载。
+- 永久 flash 版可以是 `TEXT_BASE=0x87300000`（SBL1 加载点）、`SYS_LOAD_ADDR=0x84000000`（tftp 内核/FIT 用），两者不同很正常。
+- 关键约束只有一个：**U-Boot 镜像首次被执行的地址必须等于它的 `CONFIG_TEXT_BASE`**（除非该版本支持任意地址重定位）。
+- 常见混淆：这里的“加载地址”指的是 **`go <addr>` 时 U-Boot 自身开始执行的地址**，不是 `SYS_LOAD_ADDR`。`SYS_LOAD_ADDR` 只是 `tftpboot` 不写地址时的默认存放位置；即使它不等于 TEXT_BASE，只要显式 `tftpboot 0x84000000 u-boot.bin; go 0x84000000`，就与 TEXT_BASE 一致，不会 data abort。反过来，若 `tftpboot u-boot.bin`（落到 SYS_LOAD_ADDR）后 `go` 到那个地址，则那个地址必须等于 TEXT_BASE。
+- 因此**如果坚持“tftpboot 不写地址 + go 到该默认地址”这套操作来加载新 U-Boot，则 `CONFIG_SYS_LOAD_ADDR` 必须等于该 U-Boot 的 `CONFIG_TEXT_BASE`**，否则文件落在 A、`go` 到 A 执行，而镜像是按 B 链接的，必然 data abort。注意这条只对“下载的是 U-Boot 二进制并要 go 执行”成立；若下载的是 FIT/kernel 再 `bootm`，与 TEXT_BASE 无关。
 
 ### 6.7 SPI NOR 排障结论（`sf probe` 从 ff ff ff 到成功）
 
@@ -532,6 +576,30 @@ CONFIG_IPADDR="172.18.0.136" / CONFIG_SERVERIP="172.18.0.134" / CONFIG_NETMASK="
 ## 9. 常用检查命令
 
 ```sh
+# vim swap 文件（SSH/vim 异常退出后残留，导致下次打开提示 E325）
+# vim 先试 .swp；若已存在则依次用 .swo/.swn/.../.swz，异常退出会堆积一堆
+rm -f configs/.*.sw?                 # 删掉该文件所有 swap 变体
+rm -f /var/tmp/ipq*.sw? /tmp/.*.sw?  # vim 目录备选路径也可能有残留
+# 或打开时按 D 删除；想避免再生成：vim -n <file> 或在 ~/.vimrc 写 set noswapfile
+ps -ef | grep '[v]im'                 # 确认是否真有另一个 vim 在编辑
+vim -c 'echo &directory' -c q         # 看 vim 把 swap 放哪（默认 .,/var/tmp,/tmp）
+
+# 编译机磁盘空间 / 清理
+df -h / /home
+du -sh ~/* 2>/dev/null | sort -h | tail -20
+du -sh ~/u-boot ~/u-boot-clean ~/linux-6.12 ~/arm-gnu-toolchain-13.2.Rel1-* 2>/dev/null
+# 注意：du ~/* 不含隐藏目录，隐藏目录/系统目录常在别处占满 30G 根分区
+du -sh ~/.[!.]* 2>/dev/null | sort -h | tail -20
+du -sh /var /usr /opt /root /snap 2>/dev/null | sort -h
+du -sh /var/* 2>/dev/null | sort -h | tail -20
+du -sh /tmp/* 2>/dev/null | sort -h | tail -20     # 曾出现 17G 的失控编译日志
+sudo lsof 2>/dev/null | grep deleted | awk '{print $7,$9}' | sort -n | tail  # 删了但被进程占用则不释放
+# 教训：后台编译命令若失败，make 仍可能继续写日志；用 timeout/pkill 并先确认日志大小
+# 源码树内编译产物（先试这个，安全）
+cd ~/u-boot-clean && make ARCH=arm CROSS_COMPILE=$TC distclean
+# 下载缓存 / 旧 tar 包
+ls -lh ~/arm-gnu-toolchain-13.2.Rel1-*tar.xz /tmp/*.log /tmp/*.json 2>/dev/null
+
 # Flash / 分区
 cat /proc/mtd
 hexdump -Cv -n 1024 /dev/mtd1          # MIBIB 表
@@ -598,6 +666,12 @@ $env:SSH_PASS='<密码>'
 #### defconfig 的作用，以及为什么先找它
 
 - `defconfig` 是 **Kconfig 选项的最小种子文件**：`make <board>_defconfig` 会读入它，展开生成完整的 `.config`；后续 `make` 只看 `.config`。
+  - 所以 3 行的 defconfig 可以展开成几千行的 `.config`：Kconfig 会把**每一个符号**都写进去（包括 `# CONFIG_... is not set` 的未启用项）、带上注释和自动生成的头部；`ARCH_IPQ40XX` 的 `select`/`imply` 还会连带打开一批选项。这是正常的，不代表配置错了。
+  - 统计 Enabled 项：`grep -c '^CONFIG_' .config`；统计 n 项：`grep -c '^# CONFIG_' .config`；`wc -l` 看总行数。
+  - 用户最小 defconfig 只有 4 行时，`.config` 里出现的 `CONFIG_SYS_BOOTM_LEN=0x800000`、`CONFIG_WATCHDOG_TIMEOUT_MSECS=60000` 等都是 Kconfig **默认值**，不是从 defconfig 来的；而 `CONFIG_SYS_LOAD_ADDR=`（空）说明该 string 选项既没在 defconfig 设置、也没有可用默认值，这正是 `syncconfig` 弹交互询问的原因。
+  - 为什么 4 行能展开成几千行：**Kconfig 是全源码树的全局选项数据库**，不是只处理你写下的那几个符号的依赖关系。`make <defconfig>` 会把所有 `Kconfig`（arch/、drivers/、cmd/、fs/、net/…）里定义的**每一个符号**都写进 `.config`：值为 y/m/字符串的写成 `CONFIG_X=y`，未启用的写成 `# CONFIG_X is not set`，再加上注释和自动生成头部。所以几千行里绝大多数是 `# ... is not set`，真正 `=y` 的往往只有一两百个。那 4 行只是覆盖默认值 + 触发 select/imply，不是展开全部内容的来源。
+  - **Kconfig 如何决定编译哪些文件**：`.config` 经 `syncconfig` 生成 `include/config/auto.conf`、`include/autoconf.mk`、`include/generated/autoconf.h`；各目录 `Makefile` 用 `obj-$(CONFIG_FOO) += foo.o`（如 `drivers/spi/Makefile` 的 `obj-$(CONFIG_SPI_QUP) += spi-qup.o`、`cmd/Makefile` 的 `obj-$(CONFIG_CMD_SF) += sf.o`）。CONFIG=y → 编进 `built-in.o`；=m → 模块；=n → 不编。C 代码通过 `<config.h>`/autoconf.h 拿到 `CONFIG_` 宏。DTS 由 `CONFIG_DEFAULT_DEVICE_TREE` + `CONFIG_OF_UPSTREAM` 决定，交给 `dtc`。
+  - `.config` 是生成物，不提交；改完后用 `make savedefconfig` 把它压缩回精简的 defconfig。
 - U-Boot/Linux 有成千上万个 Kconfig 选项，绝大多数默认都是 n。defconfig 记录了某一块板“已知能工作”的基线：ARCH/CPU、串口地址与时钟、SPI/MTD、FIT/bootm、env 位置、`CONFIG_TEXT_BASE`、默认设备树等。
 - **同 SoC 不同板子的 defconfig 仍不同**：串口接哪个 UART、Flash 型号/大小、env 在哪个分区、启动介质、MAC/PHY 等都因板而异。所以不能只按 SoC 随便找一个 defconfig 用，要找**本板**的。
 - 在 `configs/` 里 `grep -iE 'ipq|qcom|dk|ap'` 就是在问：“上游是否已经有人为这块板做过基线配置？”：
@@ -616,6 +690,39 @@ $env:SSH_PASS='<密码>'
 | 外设/板载设备层 | 具体 SPI NOR 芯片、具体 PHY、具体 switch 配置 | 部分有，需板级 DTS 绑定 |
 
 “有 SoC 层”只表示：**芯片内部的 IP 块怎么驱动，主线已经写好了**，我们不用从零写 clock/pinctrl/串口驱动；但这些驱动默认是 `n`，需要在 defconfig 里打开，并通过 DTS 把本板的硬件接法告诉它们。所以 Phase 1 的结论是“有引擎，但没车壳/线束”，后面工作是建板级配置，而不是从零造引擎。
+
+主线 `ARCH_IPQ40XX`（`arch/arm/Kconfig:798`）具体做了什么（实测 v2026.10）：
+
+- `select`：
+  - `CPU_V7A`、`DM`、`DM_GPIO`、`DM_SERIAL`、`DM_RESET`、`GPIO_EXTRA_HEADER`
+  - `PINCTRL`、`CLK`、`OF_CONTROL`
+  - `CLK_QCOM_IPQ4019`（`drivers/clk/qcom/clock-ipq4019.c`，GCC @ `0x1800000`）
+  - `PINCTRL_QCOM_IPQ4019`（`drivers/pinctrl/qcom/pinctrl-ipq4019.c`，TLMM @ `0x1000000`）
+- `imply`：`CMD_DM`、`OF_UPSTREAM`（所以 DTS 要放到 `dts/upstream/src/arm/`）
+- `arch/arm/mach-ipq40xx/Kconfig` 提供默认值：`SYS_SOC="ipq40xx"`、`SYS_MALLOC_F_LEN=0x2000`、`TEXT_BASE=0x87300000`、`NR_DRAM_BANKS=1`
+- 源码存在但**默认 n、需 defconfig 打开**的 SoC 相关驱动：
+  - `CONFIG_SPI_QUP` → `drivers/spi/spi-qup.c`（QUP SPI @ `0x78b5000`），`depends on ARCH_IPQ40XX`
+  - `CONFIG_MSM_SERIAL` / `CONFIG_DEBUG_UART_MSM` → `drivers/serial/serial_msm.c`（UART @ `0x78af000`）
+  - `CONFIG_SMEM` → `drivers/smem/`（`depends on ARCH_SNAPDRAGON || ARCH_IPQ40XX`）
+  - `CONFIG_ESSEDMA` → `drivers/net/essedma.c`（`depends on DM_ETH && ARCH_IPQ40XX`）
+  - `CONFIG_MDIO_IPQ4019` → `drivers/net/mdio-ipq4019.c`（`depends on DM_MDIO`）
+  - `CONFIG_FIT`、`CONFIG_CMD_BOOTM`、`CONFIG_CMD_SF`、`CONFIG_DM_SPI_FLASH` 等通用选项
+- 注意依赖陷阱：`CLK_QCOM` 是 `def_bool n` 且 `depends on CLK && DM_RESET && POWER_DOMAIN`，所以 defconfig 还必须开 `CONFIG_POWER_DOMAIN=y`，否则出现 unmet dependency 警告。实测用户运行 `make ... ipq4019_defconfig` 时打印：
+  ```
+  WARNING: unmet direct dependencies detected for CLK_QCOM
+    Depends on [n]: (ARCH_SNAPDRAGON [=n] || ARCH_IPQ40XX [=y]) && CLK [=y] && DM_RESET [=y] && POWER_DOMAIN [=n]
+    Selected by [y]:
+    - CLK_QCOM_IPQ4019 [=y] && (...)
+  ```
+  这是 Kconfig 警告（非致命），表示 `ARCH_IPQ40XX` 自动 `select CLK_QCOM_IPQ4019` → 又 `select CLK_QCOM`，但 CLK_QCOM 还要求 POWER_DOMAIN=y。修复：在 defconfig 加 `CONFIG_POWER_DOMAIN=y` 后重新生成 .config。另：若用系统 `arm-linux-gnueabi-`（GCC 7.3）编译，后续 `make` 会触发 `checkgcc10` 失败，必须用 Arm GNU 13.2 工具链。
+
+**“SoC 支持”≠“驱动已经编进镜像”**，它其实是三件不同的事：
+
+1. **代码存在**：源码树里有 `spi-qup.c` / `serial_msm.c` / `essedma.c` 等驱动，且 Kconfig 条目写明了 `depends on ARCH_IPQ40XX` 或 `ARCH_SNAPDRAGON || ARCH_IPQ40XX`——说明这些驱动“能用于这个 SoC”。
+2. **默认是否打开**：只有 `ARCH_IPQ40XX` 用 `select` 自动打开的（如 `CLK_QCOM_IPQ4019`、`PINCTRL_QCOM_IPQ4019`）才会真编进镜像；`SPI_QUP`、`MSM_SERIAL`、`ESSEDMA`、`SMEM`、`FIT`、`CMD_SF` 等默认是 `n`，必须在 defconfig 里写 `=y`。
+3. **硬件是否绑定**：即使驱动编进去了，U-Boot 还需要 DTS 告诉它“串口是 `blsp1_uart1@78af000`、SPI 是 `blsp1_spi1@78b5000`、Flash 挂在这个控制器下、CS 用 gpio12”等；没有板级 DTS，驱动probe 不到设备。
+
+一句话：**SoC 层只保证“有合适的驱动且能编译”，defconfig 决定“哪些驱动真编进去”，DTS 决定“编进去的驱动对应哪块硬件”。**
 
 ### 10.2 每一步用的工具和判据
 
